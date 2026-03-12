@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.egg-info/
+*.egg
+*.log
+
+# Virtual environments
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# FastAPI / Uvicorn
+*.db
+*.sqlite3
+instance/
+*.pid
+
+# Testing
+.coverage
+htmlcov/
+.tox/
+.nox/
+.pytest_cache/
+
+# Build / Packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+*.manifest
+*.spec
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env.local
+.env.dev
+.env.prod
+.env.test
+
+# Migrations (if using Alembic)
+migrations/versions/*.pyc
+migrations/versions/*.pyo
+
+docker-compose.override.yml
+*.dockerfile
