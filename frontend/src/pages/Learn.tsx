@@ -1,4 +1,4 @@
-import {useEffect, useMemo, useState} from 'react';
+import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {motion} from 'framer-motion';
 import LanguageCombobox from '@/components/LanguageCombobox';
 import useUserCamera from '@/hooks/useUserCamera';
@@ -10,6 +10,18 @@ type ProgressState = {
   subject: string;
   language: string;
   signIndex: number;
+};
+
+type WsEvent = {
+  type: string;
+  payload?: Record<string, unknown>;
+};
+
+type BackendStatusPayload = {
+  geminiLive?: {
+    enabled?: boolean;
+    reason?: string;
+  };
 };
 
 const STORAGE_KEY = 'hearme.learn.progress.v1';
@@ -100,7 +112,286 @@ export default function Learn() {
   const [question, setQuestion] = useState('');
   const [lastAnswer, setLastAnswer] = useState<string | null>(null);
 
+  const [captionText, setCaptionText] = useState<string | null>(null);
+  const [feedbackText, setFeedbackText] = useState<string | null>(null);
+  const [geminiStatus, setGeminiStatus] = useState<string | null>(null);
+  const [lastFeedbackAt, setLastFeedbackAt] = useState<number | null>(null);
+  const [now, setNow] = useState<number>(() => Date.now());
+  const [micEnabled, setMicEnabled] = useState(false);
+  const [micStatus, setMicStatus] = useState<
+    'idle' | 'requesting' | 'active' | 'blocked'
+  >('idle');
+  const [wsStatus, setWsStatus] = useState<
+    'disconnected' | 'connecting' | 'ready'
+  >('connecting');
+  const [wsError, setWsError] = useState<string | null>(null);
+
+  const wsRef = useRef<WebSocket | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const targetSignIdRef = useRef<string>('');
+  const targetSignLabelRef = useRef<string>('');
+  const learnPathRef = useRef<LearnPath>(learnPath);
+  const subjectRef = useRef<string>(subject);
+  const languageRef = useRef<string>(language);
+
   const {videoRef, status, start} = useUserCamera();
+
+  useEffect(() => {
+    learnPathRef.current = learnPath;
+    subjectRef.current = subject;
+    languageRef.current = language;
+  }, [language, learnPath, subject]);
+
+  useEffect(() => {
+    const ws = new WebSocket('ws://localhost:8000/stream');
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      setWsError(null);
+      const msg = {
+        type: 'session.start',
+        payload: {
+          learnPath: learnPathRef.current,
+          subject: subjectRef.current,
+          spokenLanguage: languageRef.current,
+          targetSignId: targetSignIdRef.current,
+          targetSignLabel: targetSignLabelRef.current,
+          client: {app: 'frontend', version: 'v1'}
+        }
+      };
+      ws.send(JSON.stringify(msg));
+    };
+
+    ws.onmessage = ev => {
+      try {
+        const data = JSON.parse(String(ev.data)) as WsEvent;
+        if (data.type === 'status') {
+          const p = (data.payload ?? {}) as BackendStatusPayload;
+          const enabled = Boolean(p.geminiLive?.enabled);
+          const reason = String(p.geminiLive?.reason ?? '');
+          setGeminiStatus(
+            enabled
+              ? `Gemini: enabled (${reason})`
+              : `Gemini: disabled (${reason})`
+          );
+          return;
+        }
+        if (data.type === 'session.ready') {
+          setWsStatus('ready');
+          return;
+        }
+        if (data.type === 'lesson.text') {
+          const text = String(data.payload?.text ?? '');
+          setCaptionText(text);
+          return;
+        }
+        if (data.type === 'practice.feedback') {
+          const correct = Boolean(data.payload?.correct);
+          const reason = String(data.payload?.reason ?? '');
+          setFeedbackText(
+            correct ? `Correct. ${reason}` : `Try again. ${reason}`
+          );
+          setLastFeedbackAt(Date.now());
+          return;
+        }
+        if (data.type === 'error') {
+          setWsError(String(data.payload?.message ?? 'Unknown error'));
+          return;
+        }
+      } catch {
+        setWsError('Failed to parse backend message');
+      }
+    };
+
+    ws.onerror = () => {
+      setWsError('WebSocket error');
+    };
+
+    ws.onclose = () => {
+      setWsStatus('disconnected');
+    };
+
+    return () => {
+      ws.close();
+      wsRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    const cleanup = () => {
+      const proc = processorRef.current;
+      processorRef.current = null;
+      try {
+        proc?.disconnect();
+      } catch {
+        // ignore
+      }
+
+      const ctx = audioContextRef.current;
+      audioContextRef.current = null;
+      try {
+        void ctx?.close();
+      } catch {
+        // ignore
+      }
+
+      const stream = micStreamRef.current;
+      micStreamRef.current = null;
+      stream?.getTracks().forEach(t => t.stop());
+    };
+
+    if (!micEnabled) {
+      cleanup();
+      return;
+    }
+
+    let cancelled = false;
+
+    const floatTo16BitPCM = (input: Float32Array): ArrayBuffer => {
+      const buffer = new ArrayBuffer(input.length * 2);
+      const view = new DataView(buffer);
+      for (let i = 0; i < input.length; i++) {
+        let s = Math.max(-1, Math.min(1, input[i] ?? 0));
+        s = s < 0 ? s * 0x8000 : s * 0x7fff;
+        view.setInt16(i * 2, s, true);
+      }
+      return buffer;
+    };
+
+    const arrayBufferToBase64 = (buffer: ArrayBuffer): string => {
+      const bytes = new Uint8Array(buffer);
+      let binary = '';
+      const chunkSize = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        const chunk = bytes.subarray(i, i + chunkSize);
+        binary += String.fromCharCode(...chunk);
+      }
+      return btoa(binary);
+    };
+
+    const startMic = async () => {
+      try {
+        setMicStatus('requesting');
+        const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+        if (cancelled) {
+          stream.getTracks().forEach(t => t.stop());
+          return;
+        }
+
+        micStreamRef.current = stream;
+        const ctx = new AudioContext({sampleRate: 16000});
+        audioContextRef.current = ctx;
+        const source = ctx.createMediaStreamSource(stream);
+
+        const processor = ctx.createScriptProcessor(4096, 1, 1);
+        processorRef.current = processor;
+
+        processor.onaudioprocess = e => {
+          try {
+            const sock = wsRef.current;
+            if (!sock || sock.readyState !== WebSocket.OPEN) return;
+            const input = e.inputBuffer.getChannelData(0);
+            const pcm = floatTo16BitPCM(input);
+            const base64 = arrayBufferToBase64(pcm);
+            sock.send(
+              JSON.stringify({
+                type: 'input.audio',
+                payload: {
+                  mime: 'audio/pcm;rate=16000',
+                  data: base64,
+                  ts: Date.now()
+                }
+              })
+            );
+          } catch {
+            // ignore
+          }
+        };
+
+        source.connect(processor);
+        processor.connect(ctx.destination);
+        setMicStatus('active');
+      } catch {
+        cleanup();
+        setMicStatus('blocked');
+        setMicEnabled(false);
+      }
+    };
+
+    void startMic();
+
+    return () => {
+      cancelled = true;
+      cleanup();
+    };
+  }, [micEnabled]);
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      setNow(Date.now());
+    }, 1000);
+
+    return () => window.clearInterval(id);
+  }, []);
+
+  const captureAndSendFrame = useCallback(
+    (opts?: {silent?: boolean}) => {
+      const silent = Boolean(opts?.silent);
+      const ws = wsRef.current;
+      const video = videoRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        if (!silent) setWsError('Backend is not connected');
+        return;
+      }
+      if (!video) {
+        if (!silent) setWsError('Camera video not ready');
+        return;
+      }
+
+      const w = video.videoWidth || 640;
+      const h = video.videoHeight || 360;
+
+      let canvas = canvasRef.current;
+      if (!canvas) {
+        canvas = document.createElement('canvas');
+        canvasRef.current = canvas;
+      }
+
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        if (!silent) setWsError('Canvas not available');
+        return;
+      }
+
+      ctx.drawImage(video, 0, 0, w, h);
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.72);
+      const base64 = dataUrl.split(',')[1] ?? '';
+
+      ws.send(
+        JSON.stringify({
+          type: 'input.frame',
+          payload: {mime: 'image/jpeg', data: base64, ts: Date.now()}
+        })
+      );
+    },
+    [videoRef]
+  );
+
+  useEffect(() => {
+    if (wsStatus !== 'ready') return;
+    if (status.state !== 'active') return;
+
+    const id = window.setInterval(() => {
+      captureAndSendFrame({silent: true});
+    }, 500);
+
+    return () => window.clearInterval(id);
+  }, [captureAndSendFrame, status.state, wsStatus]);
 
   const subjectOptions = useMemo(() => {
     const base = ['Basic Sign Language', 'Science', 'Math', 'History'];
@@ -122,6 +413,28 @@ export default function Learn() {
       : {id: 'unknown', title: 'Sign', meaning: ''};
 
   useEffect(() => {
+    targetSignIdRef.current = activeSign.id;
+    targetSignLabelRef.current = activeSign.title;
+  }, [activeSign.id, activeSign.title]);
+
+  useEffect(() => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const msg = {
+      type: 'session.start',
+      payload: {
+        learnPath,
+        subject,
+        spokenLanguage: language,
+        targetSignId: targetSignIdRef.current,
+        targetSignLabel: targetSignLabelRef.current,
+        client: {app: 'frontend', version: 'v1'}
+      }
+    };
+    ws.send(JSON.stringify(msg));
+  }, [activeSign.id, activeSign.title, language, learnPath, subject]);
+
+  useEffect(() => {
     const payload: ProgressState = {learnPath, subject, language, signIndex};
     safeSetLocalStorageItem(STORAGE_KEY, JSON.stringify(payload));
   }, [language, learnPath, signIndex, subject]);
@@ -134,6 +447,9 @@ export default function Learn() {
         : status.state === 'blocked'
           ? 'Camera blocked'
           : 'Camera idle';
+
+  const feedbackStale =
+    lastFeedbackAt == null ? true : now - lastFeedbackAt > 4500;
 
   return (
     <div className="min-h-screen bg-background">
@@ -154,8 +470,41 @@ export default function Learn() {
             <div className="text-sm font-medium text-foreground">
               {cameraStateLabel}
             </div>
+            <div className="text-xs text-muted-foreground mt-2">Backend</div>
+            <div className="text-sm font-medium text-foreground">
+              {wsStatus === 'ready'
+                ? 'Connected'
+                : wsStatus === 'connecting'
+                  ? 'Connecting'
+                  : 'Disconnected'}
+            </div>
+            {geminiStatus ? (
+              <div className="mt-2">
+                <div className="text-xs text-muted-foreground">AI</div>
+                <div className="text-xs text-foreground">{geminiStatus}</div>
+              </div>
+            ) : null}
+            <div className="mt-2">
+              <div className="text-xs text-muted-foreground">Mic</div>
+              <div className="text-xs text-foreground">
+                {micStatus === 'active'
+                  ? 'On'
+                  : micStatus === 'requesting'
+                    ? 'Requesting'
+                    : micStatus === 'blocked'
+                      ? 'Blocked'
+                      : 'Off'}
+              </div>
+            </div>
           </div>
         </div>
+
+        {wsError ? (
+          <div className="mt-4 rounded-xl border border-border bg-card px-4 py-3 text-sm text-foreground">
+            <div className="text-xs text-muted-foreground">Backend message</div>
+            <div className="mt-1">{wsError}</div>
+          </div>
+        ) : null}
 
         <div className="mt-6 grid grid-cols-1 lg:grid-cols-2 gap-6">
           <motion.section
@@ -193,7 +542,7 @@ export default function Learn() {
                 Caption / translation
               </div>
               <div className="mt-1 text-sm text-foreground leading-relaxed">
-                {activeSign.title}: {activeSign.meaning}
+                {captionText ?? `${activeSign.title}: ${activeSign.meaning}`}
               </div>
             </div>
           </motion.section>
@@ -263,8 +612,14 @@ export default function Learn() {
                 Practice feedback
               </div>
               <div className="mt-1 text-sm text-foreground leading-relaxed">
-                Use the controls below to repeat the demo, try the sign, and
-                continue.
+                {feedbackText ??
+                  (wsStatus !== 'ready'
+                    ? 'Waiting for backend connection.'
+                    : status.state !== 'active'
+                      ? 'Waiting for camera.'
+                      : feedbackStale
+                        ? 'No sign detected / waiting for analysis.'
+                        : 'Waiting for analysis...')}
               </div>
             </div>
           </motion.section>
@@ -350,6 +705,20 @@ export default function Learn() {
                 </div>
 
                 <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMicEnabled(v => {
+                        const next = !v;
+                        setMicStatus(next ? 'requesting' : 'idle');
+                        return next;
+                      });
+                    }}
+                    className="rounded-lg border border-border bg-background px-4 py-2 text-sm font-semibold text-foreground hover:bg-muted/40"
+                  >
+                    {micEnabled ? 'Mic on' : 'Mic off'}
+                  </button>
+
                   <button
                     type="button"
                     onClick={() => setAskOpen(true)}

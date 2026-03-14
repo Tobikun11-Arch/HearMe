@@ -52,6 +52,9 @@ Thumbs.db
 .env.dev
 .env.prod
 .env.test
+*.env*
+
+!.env.example
 
 # Migrations (if using Alembic)
 migrations/versions/*.pyc
