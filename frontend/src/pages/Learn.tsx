@@ -2,6 +2,7 @@ import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {motion} from 'framer-motion';
 import LanguageCombobox from '@/components/LanguageCombobox';
 import useUserCamera from '@/hooks/useUserCamera';
+import {Hands} from '@mediapipe/hands';
 
 type LearnPath = 'basic' | 'subject';
 
@@ -25,6 +26,9 @@ type BackendStatusPayload = {
 };
 
 const STORAGE_KEY = 'hearme.learn.progress.v1';
+const WS_URL = 'ws://localhost:8000/stream';
+const RECONNECT_BASE_MS = 1500;
+const RECONNECT_MAX_MS = 20000;
 
 const BASIC_SIGNS = [
   {id: 'hello', title: 'Hello', meaning: 'A common greeting.'},
@@ -117,25 +121,49 @@ export default function Learn() {
   const [geminiStatus, setGeminiStatus] = useState<string | null>(null);
   const [lastFeedbackAt, setLastFeedbackAt] = useState<number | null>(null);
   const [now, setNow] = useState<number>(() => Date.now());
-  const [micEnabled, setMicEnabled] = useState(false);
-  const [micStatus, setMicStatus] = useState<
-    'idle' | 'requesting' | 'active' | 'blocked'
-  >('idle');
   const [wsStatus, setWsStatus] = useState<
     'disconnected' | 'connecting' | 'ready'
   >('connecting');
   const [wsError, setWsError] = useState<string | null>(null);
+  const [debugLogs, setDebugLogs] = useState<
+    {ts: string; level: 'info' | 'warn' | 'error' | 'debug'; msg: string}[]
+  >([]);
+  const [showDebug, setShowDebug] = useState(false);
+  const debugRef = useRef<HTMLDivElement | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const micStreamRef = useRef<MediaStream | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const mpHandsRef = useRef<unknown>(null);
+  const lastLandmarksSentAtRef = useRef<number>(0);
   const targetSignIdRef = useRef<string>('');
   const targetSignLabelRef = useRef<string>('');
   const learnPathRef = useRef<LearnPath>(learnPath);
   const subjectRef = useRef<string>(subject);
   const languageRef = useRef<string>(language);
+
+  // Reconnect state
+  const reconnectDelayRef = useRef<number>(RECONNECT_BASE_MS);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const unmountedRef = useRef<boolean>(false);
+
+  const addLog = useCallback(
+    (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => {
+      const ts = new Date().toLocaleTimeString('en-US', {
+        hour12: false,
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
+      });
+      setDebugLogs(prev => {
+        const next = [...prev, {ts, level, msg}];
+        return next.length > 200 ? next.slice(-200) : next;
+      });
+      // also mirror to browser console
+      if (level === 'error') console.error('[hearme]', msg);
+      else if (level === 'warn') console.warn('[hearme]', msg);
+      else console.log('[hearme]', msg);
+    },
+    []
+  );
 
   const {videoRef, status, start} = useUserCamera();
 
@@ -145,264 +173,255 @@ export default function Learn() {
     languageRef.current = language;
   }, [language, learnPath, subject]);
 
+  // ── MediaPipe Hands (landmarks) ───────────────────────────────────────────
   useEffect(() => {
-    const ws = new WebSocket('ws://localhost:8000/stream');
+    const video = videoRef.current;
+    if (!video) return;
+    if (status.state !== 'active') return;
+
+    type MpPoint = {x: number; y: number; z: number};
+    type MpResults = {multiHandLandmarks?: MpPoint[][]};
+
+    const hands = new Hands({
+      locateFile: (file: string) =>
+        `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+    hands.setOptions({
+      maxNumHands: 1,
+      modelComplexity: 0,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5
+    });
+
+    hands.onResults((results: MpResults) => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+      const landmarks = results.multiHandLandmarks?.[0];
+      if (!landmarks) return;
+
+      // Throttle landmark sending (avoid flooding WS)
+      const nowTs = Date.now();
+      if (nowTs - lastLandmarksSentAtRef.current < 80) return;
+      lastLandmarksSentAtRef.current = nowTs;
+
+      ws.send(
+        JSON.stringify({
+          type: 'input.landmarks',
+          payload: {
+            ts: nowTs,
+            landmarks: landmarks.map((p: MpPoint) => ({x: p.x, y: p.y, z: p.z}))
+          }
+        })
+      );
+    });
+    mpHandsRef.current = hands;
+
+    let rafId: number | null = null;
+    const loop = async () => {
+      try {
+        if (video.videoWidth > 0 && video.videoHeight > 0) {
+          await hands.send({image: video});
+        }
+      } catch {
+        // ignore
+      } finally {
+        rafId = window.requestAnimationFrame(() => {
+          void loop();
+        });
+      }
+    };
+
+    rafId = window.requestAnimationFrame(() => {
+      void loop();
+    });
+
+    return () => {
+      if (rafId !== null) window.cancelAnimationFrame(rafId);
+      try {
+        void (
+          mpHandsRef.current as {close?: () => Promise<void> | void} | null
+        )?.close?.();
+      } catch {
+        // ignore
+      }
+      mpHandsRef.current = null;
+    };
+  }, [status.state, videoRef]);
+
+  // ── WebSocket with auto-reconnect ─────────────────────────────────────────
+  const connectWs = useCallback(() => {
+    if (unmountedRef.current) return;
+
+    setWsStatus('connecting');
+    const ws = new WebSocket(WS_URL);
     wsRef.current = ws;
 
     ws.onopen = () => {
+      if (unmountedRef.current) {
+        ws.close();
+        return;
+      }
+      reconnectDelayRef.current = RECONNECT_BASE_MS; // reset backoff on success
       setWsError(null);
-      const msg = {
-        type: 'session.start',
-        payload: {
-          learnPath: learnPathRef.current,
-          subject: subjectRef.current,
-          spokenLanguage: languageRef.current,
-          targetSignId: targetSignIdRef.current,
-          targetSignLabel: targetSignLabelRef.current,
-          client: {app: 'frontend', version: 'v1'}
-        }
-      };
-      ws.send(JSON.stringify(msg));
+      addLog('info', 'WS connected — sending session.start');
+      ws.send(
+        JSON.stringify({
+          type: 'session.start',
+          payload: {
+            learnPath: learnPathRef.current,
+            subject: subjectRef.current,
+            spokenLanguage: languageRef.current,
+            targetSignId: targetSignIdRef.current,
+            targetSignLabel: targetSignLabelRef.current,
+            client: {app: 'frontend', version: 'v1'}
+          }
+        })
+      );
     };
 
     ws.onmessage = ev => {
       try {
         const data = JSON.parse(String(ev.data)) as WsEvent;
+
         if (data.type === 'status') {
           const p = (data.payload ?? {}) as BackendStatusPayload;
           const enabled = Boolean(p.geminiLive?.enabled);
           const reason = String(p.geminiLive?.reason ?? '');
-          setGeminiStatus(
-            enabled
-              ? `Gemini: enabled (${reason})`
-              : `Gemini: disabled (${reason})`
-          );
+          const label = enabled
+            ? `Gemini: enabled (${reason})`
+            : `Gemini: disabled (${reason})`;
+          setGeminiStatus(label);
+          addLog('info', `[status] ${label}`);
           return;
         }
+
         if (data.type === 'session.ready') {
           setWsStatus('ready');
+          addLog('info', '[session.ready] Backend session is ready');
           return;
         }
+
         if (data.type === 'lesson.text') {
           const text = String(data.payload?.text ?? '');
           setCaptionText(text);
+          addLog('debug', `[lesson.text] ${text.slice(0, 100)}`);
           return;
         }
+
         if (data.type === 'practice.feedback') {
           const correct = Boolean(data.payload?.correct);
           const reason = String(data.payload?.reason ?? '');
-          setFeedbackText(
-            correct ? `Correct. ${reason}` : `Try again. ${reason}`
-          );
+          const feedback = correct
+            ? `✓ Correct! ${reason}`
+            : `Try again. ${reason}`;
+          setFeedbackText(feedback);
           setLastFeedbackAt(Date.now());
+          addLog(
+            correct ? 'info' : 'warn',
+            `[feedback] correct=${correct}  reason="${reason}"`
+          );
           return;
         }
+
         if (data.type === 'error') {
-          setWsError(String(data.payload?.message ?? 'Unknown error'));
+          const errMsg = String(data.payload?.message ?? 'Unknown error');
+          setWsError(errMsg);
+          addLog('error', `[error from backend] ${errMsg}`);
           return;
         }
+
+        addLog('debug', `[ws msg] unhandled type="${data.type}"`);
       } catch {
         setWsError('Failed to parse backend message');
       }
     };
 
     ws.onerror = () => {
-      setWsError('WebSocket error');
+      setWsError('WebSocket connection error — retrying…');
+      addLog('error', 'WS error event fired');
     };
 
     ws.onclose = () => {
+      wsRef.current = null;
+      if (unmountedRef.current) return;
+
       setWsStatus('disconnected');
+      addLog(
+        'warn',
+        `WS closed — reconnecting in ${reconnectDelayRef.current}ms`
+      );
+
+      // Exponential backoff reconnect
+      const delay = reconnectDelayRef.current;
+      reconnectDelayRef.current = Math.min(delay * 2, RECONNECT_MAX_MS);
+
+      reconnectTimerRef.current = setTimeout(() => {
+        // eslint-disable-next-line react-hooks/immutability
+        if (!unmountedRef.current) connectWs();
+      }, delay);
     };
+  }, [addLog]);
+
+  useEffect(() => {
+    unmountedRef.current = false;
+    connectWs();
 
     return () => {
-      ws.close();
+      unmountedRef.current = true;
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      wsRef.current?.close();
       wsRef.current = null;
     };
-  }, []);
+  }, [connectWs]);
 
+  // ── Send session.start when sign / settings change ────────────────────────
   useEffect(() => {
-    const cleanup = () => {
-      const proc = processorRef.current;
-      processorRef.current = null;
-      try {
-        proc?.disconnect();
-      } catch {
-        // ignore
-      }
-
-      const ctx = audioContextRef.current;
-      audioContextRef.current = null;
-      try {
-        void ctx?.close();
-      } catch {
-        // ignore
-      }
-
-      const stream = micStreamRef.current;
-      micStreamRef.current = null;
-      stream?.getTracks().forEach(t => t.stop());
-    };
-
-    if (!micEnabled) {
-      cleanup();
-      return;
-    }
-
-    let cancelled = false;
-
-    const floatTo16BitPCM = (input: Float32Array): ArrayBuffer => {
-      const buffer = new ArrayBuffer(input.length * 2);
-      const view = new DataView(buffer);
-      for (let i = 0; i < input.length; i++) {
-        let s = Math.max(-1, Math.min(1, input[i] ?? 0));
-        s = s < 0 ? s * 0x8000 : s * 0x7fff;
-        view.setInt16(i * 2, s, true);
-      }
-      return buffer;
-    };
-
-    const arrayBufferToBase64 = (buffer: ArrayBuffer): string => {
-      const bytes = new Uint8Array(buffer);
-      let binary = '';
-      const chunkSize = 0x8000;
-      for (let i = 0; i < bytes.length; i += chunkSize) {
-        const chunk = bytes.subarray(i, i + chunkSize);
-        binary += String.fromCharCode(...chunk);
-      }
-      return btoa(binary);
-    };
-
-    const startMic = async () => {
-      try {
-        setMicStatus('requesting');
-        const stream = await navigator.mediaDevices.getUserMedia({audio: true});
-        if (cancelled) {
-          stream.getTracks().forEach(t => t.stop());
-          return;
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    addLog(
+      'info',
+      `[session.start] sending  sign=${targetSignIdRef.current}  path=${learnPath}  subject=${subject}`
+    );
+    ws.send(
+      JSON.stringify({
+        type: 'session.start',
+        payload: {
+          learnPath,
+          subject,
+          spokenLanguage: language,
+          targetSignId: targetSignIdRef.current,
+          targetSignLabel: targetSignLabelRef.current,
+          client: {app: 'frontend', version: 'v1'}
         }
+      })
+    );
+    // Reset display state when sign changes
+    addLog(
+      'info',
+      `[sign change] new sign: ${targetSignLabelRef.current} (${targetSignIdRef.current})`
+    );
+    setCaptionText(null);
+    setFeedbackText(null);
+    setLastFeedbackAt(null);
+  }, [language, learnPath, signIndex, subject, addLog]);
 
-        micStreamRef.current = stream;
-        const ctx = new AudioContext({sampleRate: 16000});
-        audioContextRef.current = ctx;
-        const source = ctx.createMediaStreamSource(stream);
-
-        const processor = ctx.createScriptProcessor(4096, 1, 1);
-        processorRef.current = processor;
-
-        processor.onaudioprocess = e => {
-          try {
-            const sock = wsRef.current;
-            if (!sock || sock.readyState !== WebSocket.OPEN) return;
-            const input = e.inputBuffer.getChannelData(0);
-            const pcm = floatTo16BitPCM(input);
-            const base64 = arrayBufferToBase64(pcm);
-            sock.send(
-              JSON.stringify({
-                type: 'input.audio',
-                payload: {
-                  mime: 'audio/pcm;rate=16000',
-                  data: base64,
-                  ts: Date.now()
-                }
-              })
-            );
-          } catch {
-            // ignore
-          }
-        };
-
-        source.connect(processor);
-        processor.connect(ctx.destination);
-        setMicStatus('active');
-      } catch {
-        cleanup();
-        setMicStatus('blocked');
-        setMicEnabled(false);
-      }
-    };
-
-    void startMic();
-
-    return () => {
-      cancelled = true;
-      cleanup();
-    };
-  }, [micEnabled]);
-
+  // ── Clock tick ────────────────────────────────────────────────────────────
   useEffect(() => {
-    const id = window.setInterval(() => {
-      setNow(Date.now());
-    }, 1000);
-
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(id);
   }, []);
 
-  const captureAndSendFrame = useCallback(
-    (opts?: {silent?: boolean}) => {
-      const silent = Boolean(opts?.silent);
-      const ws = wsRef.current;
-      const video = videoRef.current;
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
-        if (!silent) setWsError('Backend is not connected');
-        return;
-      }
-      if (!video) {
-        if (!silent) setWsError('Camera video not ready');
-        return;
-      }
-
-      const w = video.videoWidth || 640;
-      const h = video.videoHeight || 360;
-
-      let canvas = canvasRef.current;
-      if (!canvas) {
-        canvas = document.createElement('canvas');
-        canvasRef.current = canvas;
-      }
-
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        if (!silent) setWsError('Canvas not available');
-        return;
-      }
-
-      ctx.drawImage(video, 0, 0, w, h);
-      const dataUrl = canvas.toDataURL('image/jpeg', 0.72);
-      const base64 = dataUrl.split(',')[1] ?? '';
-
-      ws.send(
-        JSON.stringify({
-          type: 'input.frame',
-          payload: {mime: 'image/jpeg', data: base64, ts: Date.now()}
-        })
-      );
-    },
-    [videoRef]
+  // ── Derived data ──────────────────────────────────────────────────────────
+  const subjectOptions = useMemo(
+    () => ['Basic Sign Language', 'Science', 'Math', 'History'],
+    []
   );
-
-  useEffect(() => {
-    if (wsStatus !== 'ready') return;
-    if (status.state !== 'active') return;
-
-    const id = window.setInterval(() => {
-      captureAndSendFrame({silent: true});
-    }, 500);
-
-    return () => window.clearInterval(id);
-  }, [captureAndSendFrame, status.state, wsStatus]);
-
-  const subjectOptions = useMemo(() => {
-    const base = ['Basic Sign Language', 'Science', 'Math', 'History'];
-    return base;
-  }, []);
 
   const activeSignList = useMemo(() => {
     if (learnPath === 'basic' || subject === 'Basic Sign Language')
       return BASIC_SIGNS;
-    const list = SUBJECT_SIGNS[subject] ?? SUBJECT_SIGNS.Science;
-    return list;
+    return SUBJECT_SIGNS[subject] ?? SUBJECT_SIGNS.Science;
   }, [learnPath, subject]);
 
   const activeSign =
@@ -418,23 +437,6 @@ export default function Learn() {
   }, [activeSign.id, activeSign.title]);
 
   useEffect(() => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const msg = {
-      type: 'session.start',
-      payload: {
-        learnPath,
-        subject,
-        spokenLanguage: language,
-        targetSignId: targetSignIdRef.current,
-        targetSignLabel: targetSignLabelRef.current,
-        client: {app: 'frontend', version: 'v1'}
-      }
-    };
-    ws.send(JSON.stringify(msg));
-  }, [activeSign.id, activeSign.title, language, learnPath, subject]);
-
-  useEffect(() => {
     const payload: ProgressState = {learnPath, subject, language, signIndex};
     safeSetLocalStorageItem(STORAGE_KEY, JSON.stringify(payload));
   }, [language, learnPath, signIndex, subject]);
@@ -443,17 +445,28 @@ export default function Learn() {
     status.state === 'active'
       ? 'Camera active'
       : status.state === 'requesting'
-        ? 'Requesting camera permission'
+        ? 'Requesting camera…'
         : status.state === 'blocked'
           ? 'Camera blocked'
           : 'Camera idle';
 
   const feedbackStale =
     lastFeedbackAt == null ? true : now - lastFeedbackAt > 4500;
+  const feedbackAge =
+    lastFeedbackAt == null ? null : Math.floor((now - lastFeedbackAt) / 1000);
 
+  const wsStatusLabel =
+    wsStatus === 'ready'
+      ? 'Connected'
+      : wsStatus === 'connecting'
+        ? 'Connecting…'
+        : 'Reconnecting…';
+
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div className="min-h-screen bg-background">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-8 pb-6">
+        {/* Header */}
         <div className="flex items-start justify-between gap-6">
           <div>
             <h1 className="text-3xl sm:text-4xl font-bold text-foreground tracking-tight">
@@ -465,40 +478,35 @@ export default function Learn() {
             </p>
           </div>
 
-          <div className="hidden sm:block text-right">
+          <div className="hidden sm:block text-right shrink-0">
             <div className="text-xs text-muted-foreground">Status</div>
             <div className="text-sm font-medium text-foreground">
               {cameraStateLabel}
             </div>
             <div className="text-xs text-muted-foreground mt-2">Backend</div>
-            <div className="text-sm font-medium text-foreground">
-              {wsStatus === 'ready'
-                ? 'Connected'
-                : wsStatus === 'connecting'
-                  ? 'Connecting'
-                  : 'Disconnected'}
+            <div
+              className={`text-sm font-medium ${
+                wsStatus === 'ready'
+                  ? 'text-green-600 dark:text-green-400'
+                  : wsStatus === 'connecting'
+                    ? 'text-yellow-600 dark:text-yellow-400'
+                    : 'text-red-500'
+              }`}
+            >
+              {wsStatusLabel}
             </div>
             {geminiStatus ? (
               <div className="mt-2">
                 <div className="text-xs text-muted-foreground">AI</div>
-                <div className="text-xs text-foreground">{geminiStatus}</div>
+                <div className="text-xs text-foreground max-w-56 text-right">
+                  {geminiStatus}
+                </div>
               </div>
             ) : null}
-            <div className="mt-2">
-              <div className="text-xs text-muted-foreground">Mic</div>
-              <div className="text-xs text-foreground">
-                {micStatus === 'active'
-                  ? 'On'
-                  : micStatus === 'requesting'
-                    ? 'Requesting'
-                    : micStatus === 'blocked'
-                      ? 'Blocked'
-                      : 'Off'}
-              </div>
-            </div>
           </div>
         </div>
 
+        {/* Error banner */}
         {wsError ? (
           <div className="mt-4 rounded-xl border border-border bg-card px-4 py-3 text-sm text-foreground">
             <div className="text-xs text-muted-foreground">Backend message</div>
@@ -506,7 +514,9 @@ export default function Learn() {
           </div>
         ) : null}
 
+        {/* Main panels */}
         <div className="mt-6 grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* Teacher panel */}
           <motion.section
             initial={{opacity: 0, y: 8}}
             animate={{opacity: 1, y: 0}}
@@ -547,6 +557,7 @@ export default function Learn() {
             </div>
           </motion.section>
 
+          {/* Camera panel */}
           <motion.section
             initial={{opacity: 0, y: 8}}
             animate={{opacity: 1, y: 0}}
@@ -562,7 +573,6 @@ export default function Learn() {
                   Keep your hands visible for practice
                 </div>
               </div>
-
               {status.state === 'blocked' ? (
                 <button
                   type="button"
@@ -581,7 +591,6 @@ export default function Learn() {
                 muted
                 playsInline
               />
-
               {status.state === 'requesting' ? (
                 <div className="absolute inset-0 flex items-center justify-center bg-black/40">
                   <div className="rounded-lg border border-white/15 bg-black/40 px-4 py-3 text-sm text-white">
@@ -589,7 +598,6 @@ export default function Learn() {
                   </div>
                 </div>
               ) : null}
-
               {status.state === 'blocked' ? (
                 <div className="absolute inset-0 flex items-center justify-center bg-black/50 p-6">
                   <div className="max-w-md w-full rounded-xl border border-white/15 bg-black/40 p-4 text-white">
@@ -611,20 +619,43 @@ export default function Learn() {
               <div className="text-xs text-muted-foreground">
                 Practice feedback
               </div>
-              <div className="mt-1 text-sm text-foreground leading-relaxed">
-                {feedbackText ??
-                  (wsStatus !== 'ready'
-                    ? 'Waiting for backend connection.'
-                    : status.state !== 'active'
-                      ? 'Waiting for camera.'
-                      : feedbackStale
-                        ? 'No sign detected / waiting for analysis.'
-                        : 'Waiting for analysis...')}
+              <div className="flex items-start justify-between gap-2">
+                <div
+                  className={`mt-1 text-sm leading-relaxed font-medium ${
+                    feedbackText?.startsWith('✓')
+                      ? 'text-green-600 dark:text-green-400'
+                      : feedbackText?.startsWith('Try')
+                        ? 'text-red-500'
+                        : 'text-muted-foreground'
+                  }`}
+                >
+                  {feedbackText ??
+                    (wsStatus !== 'ready'
+                      ? 'Waiting for backend connection…'
+                      : status.state !== 'active'
+                        ? 'Waiting for camera.'
+                        : feedbackStale
+                          ? 'No sign detected / waiting for analysis.'
+                          : 'Waiting for analysis…')}
+                </div>
+                {feedbackAge !== null && !feedbackStale && (
+                  <span className="mt-1 shrink-0 text-xs text-muted-foreground font-mono">
+                    {feedbackAge}s ago
+                  </span>
+                )}
+                {feedbackStale &&
+                  wsStatus === 'ready' &&
+                  status.state === 'active' && (
+                    <span className="mt-1 shrink-0 text-xs text-yellow-500 font-mono animate-pulse">
+                      ⟳ live
+                    </span>
+                  )}
               </div>
             </div>
           </motion.section>
         </div>
 
+        {/* Controls */}
         <div
           className="mt-6 rounded-xl border border-border bg-card px-4 py-4"
           style={{
@@ -702,23 +733,16 @@ export default function Learn() {
               <div className="mt-2 flex flex-col sm:flex-row gap-2 sm:items-center sm:justify-between">
                 <div className="text-xs text-muted-foreground">
                   Progress: {signIndex + 1} of {activeSignList.length}
+                  {wsStatus === 'disconnected' ? (
+                    <span className="ml-2 text-red-500">● Reconnecting…</span>
+                  ) : wsStatus === 'connecting' ? (
+                    <span className="ml-2 text-yellow-500">● Connecting…</span>
+                  ) : (
+                    <span className="ml-2 text-green-500">● Live</span>
+                  )}
                 </div>
 
                 <div className="flex flex-wrap gap-2">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setMicEnabled(v => {
-                        const next = !v;
-                        setMicStatus(next ? 'requesting' : 'idle');
-                        return next;
-                      });
-                    }}
-                    className="rounded-lg border border-border bg-background px-4 py-2 text-sm font-semibold text-foreground hover:bg-muted/40"
-                  >
-                    {micEnabled ? 'Mic on' : 'Mic off'}
-                  </button>
-
                   <button
                     type="button"
                     onClick={() => setAskOpen(true)}
@@ -731,6 +755,9 @@ export default function Learn() {
                     type="button"
                     onClick={() => {
                       setLastAnswer(null);
+                      setCaptionText(null);
+                      setFeedbackText(null);
+                      setLastFeedbackAt(null);
                     }}
                     className="rounded-lg border border-border bg-background px-4 py-2 text-sm font-semibold text-foreground hover:bg-muted/40"
                   >
@@ -746,6 +773,9 @@ export default function Learn() {
                       );
                       setSignIndex(next);
                       setLastAnswer(null);
+                      setCaptionText(null);
+                      setFeedbackText(null);
+                      setLastFeedbackAt(null);
                     }}
                     className="rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-accent-foreground hover:opacity-90"
                   >
@@ -767,6 +797,100 @@ export default function Learn() {
         </div>
       </div>
 
+      {/* Debug log panel */}
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pb-8">
+        <div className="rounded-xl border border-border bg-card overflow-hidden">
+          <button
+            type="button"
+            onClick={() => setShowDebug(v => !v)}
+            className="w-full px-4 py-3 flex items-center justify-between text-left hover:bg-muted/30 transition-colors"
+          >
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-mono font-semibold text-muted-foreground uppercase tracking-widest">
+                Debug log
+              </span>
+              <span className="rounded-full bg-muted px-2 py-0.5 text-xs font-mono text-muted-foreground">
+                {debugLogs.length}
+              </span>
+              {debugLogs.some(l => l.level === 'error') && (
+                <span className="rounded-full bg-red-500/15 px-2 py-0.5 text-xs font-mono text-red-500">
+                  {debugLogs.filter(l => l.level === 'error').length} error
+                  {debugLogs.filter(l => l.level === 'error').length !== 1
+                    ? 's'
+                    : ''}
+                </span>
+              )}
+              {debugLogs.some(l => l.level === 'warn') && (
+                <span className="rounded-full bg-yellow-500/15 px-2 py-0.5 text-xs font-mono text-yellow-600">
+                  {debugLogs.filter(l => l.level === 'warn').length} warn
+                </span>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={e => {
+                  e.stopPropagation();
+                  setDebugLogs([]);
+                }}
+                className="rounded px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50"
+              >
+                Clear
+              </button>
+              <span className="text-xs text-muted-foreground">
+                {showDebug ? '▲ hide' : '▼ show'}
+              </span>
+            </div>
+          </button>
+
+          {showDebug && (
+            <div
+              ref={debugRef}
+              className="border-t border-border h-64 overflow-y-auto font-mono text-xs bg-black/90 p-3 space-y-0.5"
+            >
+              {debugLogs.length === 0 ? (
+                <div className="text-white/30 py-4 text-center">
+                  No logs yet
+                </div>
+              ) : (
+                [...debugLogs].reverse().map((entry, i) => (
+                  <div key={i} className="flex gap-2 leading-5">
+                    <span className="text-white/30 shrink-0">{entry.ts}</span>
+                    <span
+                      className={`shrink-0 w-10 ${
+                        entry.level === 'error'
+                          ? 'text-red-400'
+                          : entry.level === 'warn'
+                            ? 'text-yellow-400'
+                            : entry.level === 'debug'
+                              ? 'text-white/40'
+                              : 'text-green-400'
+                      }`}
+                    >
+                      {entry.level}
+                    </span>
+                    <span
+                      className={`break-all ${
+                        entry.level === 'error'
+                          ? 'text-red-300'
+                          : entry.level === 'warn'
+                            ? 'text-yellow-300'
+                            : entry.level === 'debug'
+                              ? 'text-white/50'
+                              : 'text-white/90'
+                      }`}
+                    >
+                      {entry.msg}
+                    </span>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Ask question modal */}
       {askOpen ? (
         <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/50 p-4">
           <div className="w-full max-w-xl rounded-xl border border-border bg-card overflow-hidden">
@@ -798,7 +922,6 @@ export default function Learn() {
                 className="w-full min-h-28 rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-accent/40"
                 placeholder="Type your question about the meaning, usage, or when to use this sign"
               />
-
               <div className="mt-3 flex items-center justify-end gap-2">
                 <button
                   type="button"
@@ -814,11 +937,26 @@ export default function Learn() {
                   type="button"
                   onClick={() => {
                     const q = question.trim();
-                    const fallback =
-                      'This is a UI-only prototype. Next we can connect a real assistant or lesson database for richer explanations.';
-                    setLastAnswer(
-                      q ? `Question received: "${q}". ${fallback}` : fallback
-                    );
+                    const ws = wsRef.current;
+                    if (ws && ws.readyState === WebSocket.OPEN && q) {
+                      ws.send(
+                        JSON.stringify({
+                          type: 'input.question',
+                          payload: {
+                            text: q,
+                            signId: activeSign.id,
+                            signLabel: activeSign.title
+                          }
+                        })
+                      );
+                      setLastAnswer(`Question sent: "${q}"`);
+                    } else {
+                      const fallback =
+                        'Backend is not connected. Please wait for reconnection and try again.';
+                      setLastAnswer(
+                        q ? `Question received: "${q}". ${fallback}` : fallback
+                      );
+                    }
                     setAskOpen(false);
                     setQuestion('');
                   }}
